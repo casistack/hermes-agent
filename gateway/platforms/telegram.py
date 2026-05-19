@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import html as _html
 import re
@@ -4591,11 +4592,64 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(msg):
             return
+
+        if await self._try_handle_hoodclaws_approval_command(update):
+            return
+
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         self._enqueue_text_event(event)
+
+    async def _try_handle_hoodclaws_approval_command(self, update: Update) -> bool:
+        """Route explicit HoodClaws approval commands before generic agent chat.
+
+        This VM overlay is intentionally narrow: it only handles
+        ``approve COMM-NNN`` commands and delegates validation/execution to the
+        deterministic HoodClaws approval helper.
+        """
+        msg = self._effective_update_message(update)
+        text = getattr(msg, "text", None) if msg else None
+        if not text or not re.match(
+            r"^\s*approve\s+COMM-\d+(?:\s+\d{4}-\d{2}-\d{2})?\s*$",
+            text,
+            re.IGNORECASE,
+        ):
+            return False
+
+        helper = os.environ.get(
+            "HOODCLAWS_TELEGRAM_APPROVAL_HELPER",
+            "/home/hoodclaw/hoodclaws/hermes-cron-scripts/helpers/telegram_approval_poller.py",
+        )
+        helper_path = _Path(helper)
+        if not helper_path.exists():
+            logger.warning("[%s] HoodClaws approval helper missing: %s", self.name, helper)
+            return False
+
+        try:
+            payload = update.to_dict() if hasattr(update, "to_dict") else {"update_id": update.update_id}
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, str(helper_path), "--message-json", "-", "--execute-approved"],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=180,
+                check=False,
+            )
+            if proc.returncode != 0:
+                logger.error(
+                    "[%s] HoodClaws approval helper failed rc=%s stdout=%s stderr=%s",
+                    self.name,
+                    proc.returncode,
+                    proc.stdout[-1000:],
+                    proc.stderr[-1000:],
+                )
+            return True
+        except Exception as exc:
+            logger.error("[%s] HoodClaws approval helper exception: %s", self.name, exc, exc_info=True)
+            return True
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""

@@ -1458,6 +1458,21 @@ def _update_session_activity(task_id: str):
         _session_last_activity[task_id] = time.time()
 
 
+def _discard_cached_session(task_id: str, session_info: Optional[Dict[str, str]] = None) -> None:
+    """Forget a cached browser session without running close hooks.
+
+    Used for stale CDP sessions where the remote browser endpoint has already
+    died or rotated. Closing through agent-browser would reuse the same broken
+    session, so we only drop the in-memory cache and let the next command create
+    a fresh CDP-backed session.
+    """
+    with _cleanup_lock:
+        current = _active_sessions.get(task_id)
+        if session_info is None or current is session_info or current == session_info:
+            _active_sessions.pop(task_id, None)
+            _session_last_activity.pop(task_id, None)
+
+
 # Register cleanup thread stop on exit
 atexit.register(_stop_browser_cleanup_thread)
 
@@ -1647,6 +1662,66 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     }
 
 
+def _is_retryable_cdp_failure(
+    session_info: Dict[str, str],
+    command: str,
+    *,
+    returncode: Optional[int] = None,
+    stdout_text: str = "",
+    stderr_text: str = "",
+    error_text: str = "",
+) -> bool:
+    """Return True when a CDP-backed browser command should retry once.
+
+    This is intentionally narrow: only CDP override sessions qualify, and only
+    errors that strongly suggest a dead or recycled browser session trigger a
+    retry. Regular navigation slowness should not loop indefinitely.
+    """
+    if not session_info.get("cdp_url"):
+        return False
+
+    combined = "\n".join(
+        part for part in [stdout_text, stderr_text, error_text] if part
+    ).lower()
+    if not combined:
+        return False
+
+    transient_markers = (
+        "cdp websocket connect failed",
+        "connection refused",
+        "browser has been closed",
+        "browser disconnected",
+        "target page, context or browser has been closed",
+        "target closed",
+        "transport closed",
+        "session closed",
+        "command timed out after",
+        "operation timed out",
+    )
+    if not any(marker in combined for marker in transient_markers):
+        return False
+
+    if returncode not in (None, 0):
+        return True
+
+    # agent-browser often returns structured JSON failures with rc=0.
+    return command in {"open", "snapshot", "click", "type", "press", "scroll"}
+
+
+def _wait_for_cdp_endpoint(timeout: int = 12) -> None:
+    """Wait briefly for the configured CDP endpoint to become discoverable."""
+    raw_cdp_url = (os.environ.get("BROWSER_CDP_URL") or "").strip()
+    if not raw_cdp_url:
+        return
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resolved = _resolve_cdp_override(raw_cdp_url)
+        if "/devtools/browser/" in resolved.lower():
+            return
+        time.sleep(1)
+
+
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     """
     Get or create session info for the given session key.
@@ -1674,19 +1749,33 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     # Update activity timestamp for this session
     _update_session_activity(task_id)
 
-    with _cleanup_lock:
-        # Check if we already have a session for this task
-        if task_id in _active_sessions:
-            return _active_sessions[task_id]
-
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
     # URLs in the same conversation continue to use the cloud session under
     # the bare task_id key.
     force_local = _is_local_sidecar_key(task_id)
+    cdp_override = _get_cdp_override()
+
+    with _cleanup_lock:
+        # Check if we already have a session for this task. CDP override URLs
+        # can change when the supervised browser restarts, so discard stale CDP
+        # sessions instead of pinning future commands to a dead websocket.
+        existing_session = _active_sessions.get(task_id)
+        if existing_session:
+            existing_cdp = str(existing_session.get("cdp_url") or "").strip()
+            if force_local:
+                if existing_cdp:
+                    _active_sessions.pop(task_id, None)
+                else:
+                    return existing_session
+            elif existing_cdp:
+                if existing_cdp == cdp_override:
+                    return existing_session
+                _active_sessions.pop(task_id, None)
+            else:
+                return existing_session
 
     # Create session outside the lock (network call in cloud mode)
-    cdp_override = _get_cdp_override()
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
@@ -1877,6 +1966,7 @@ def _run_browser_command(
     args: List[str] = None,
     timeout: Optional[int] = None,
     _engine_override: Optional[str] = None,
+    _cdp_retry_attempted: bool = False,
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
@@ -2171,6 +2261,31 @@ def _run_browser_command(
     except Exception as e:
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
+
+    if not _cdp_retry_attempted and isinstance(result, dict):
+        with _cleanup_lock:
+            retry_session = _active_sessions.get(task_id)
+        if retry_session and _is_retryable_cdp_failure(
+            retry_session,
+            command,
+            error_text=str(result.get("error") or ""),
+            stdout_text=json.dumps(result, ensure_ascii=False),
+        ):
+            logger.warning(
+                "browser '%s' hit retryable CDP failure; discarding stale session for task=%s and retrying once",
+                command,
+                task_id,
+            )
+            _discard_cached_session(task_id, retry_session)
+            _wait_for_cdp_endpoint()
+            return _run_browser_command(
+                task_id,
+                command,
+                args,
+                timeout,
+                _engine_override,
+                _cdp_retry_attempted=True,
+            )
 
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
